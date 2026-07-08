@@ -1,0 +1,104 @@
+# lulaFi Analytics POC v1.1 - Raspberry Pi 5 (ARM64) Docker stack
+# Implements LULAFI-SDD-ANL-001 v1.1: ClickHouse analytics data plane +
+# MongoDB control plane.
+#
+# One-command install:  docker compose up -d --build
+#
+# Services:
+#   mongo       - MongoDB 7 (operational data + analytics control plane)
+#   clickhouse  - ClickHouse (analytics data plane; low-resource config baked into image)
+#   api         - Node/Express analytics API (bootstraps CH schema + seeds on first boot)
+#   portal      - React/MUI SPA served by nginx, proxies /api -> api:4000
+#
+# All base images are multi-arch and run natively on the Pi 5 (arm64/v8).
+
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: lulafi-analytics-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-lulafi}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-lulafi_poc_password}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "127.0.0.1:27017:27017"
+
+  clickhouse:
+    build: ./clickhouse
+    container_name: lulafi-analytics-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-lulafi_analytics}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-lulafi}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-lulafi_ch_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "${CLICKHOUSE_USER:-lulafi}", "--password", "${CLICKHOUSE_PASSWORD:-lulafi_ch_password}", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    ports:
+      - "127.0.0.1:8123:8123"
+
+  api:
+    build: ./api
+    container_name: lulafi-analytics-api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      DB_URI: mongodb://${MONGO_ROOT_USER:-lulafi}:${MONGO_ROOT_PASSWORD:-lulafi_poc_password}@mongo:27017
+      DB_OPERATIONAL: lulafi
+      DB_ANALYTICS: lulafi_analytics
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-lulafi_analytics}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-lulafi}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-lulafi_ch_password}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-poc-secret}
+      AUTH_TOKEN_TTL_HOURS: 12
+      SEED_ON_START: "true"
+      SEED_MONTHS: 2
+      SEED_TIMEZONE: Africa/Johannesburg
+      MIN_COHORT_DEFAULT: 10
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  portal:
+    build: ./portal
+    container_name: lulafi-analytics-portal
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${PORTAL_PORT:-8202}:80"
+
+volumes:
+  mongo_data:
+    driver: local
+  clickhouse_data:
+    driver: local
